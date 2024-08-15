@@ -172,7 +172,8 @@ impl TreeDiffCalculator {
                 tracing::info!("checkout: to == current_vv");
                 return;
             }
-            let to_frontiers = to.to_frontiers(&oplog.dag);
+            let mut dag = oplog.dag.try_lock().unwrap();
+            let to_frontiers = to.to_frontiers(&mut dag);
             let min_lamport = self.get_min_lamport_by_frontiers(&to_frontiers, oplog);
             // retreat
             let mut retreat_ops = vec![];
@@ -200,7 +201,8 @@ impl TreeDiffCalculator {
                 ));
             }
             // forward and apply
-            let current_frontiers = tree_cache.current_vv.to_frontiers(&oplog.dag);
+            let mut dag = oplog.dag.try_lock().unwrap();
+            let current_frontiers = tree_cache.current_vv.to_frontiers(&mut dag);
             let forward_min_lamport = self
                 .get_min_lamport_by_frontiers(&current_frontiers, oplog)
                 .min(min_lamport);
@@ -254,13 +256,13 @@ impl TreeDiffCalculator {
 
             let s = tracing::span!(tracing::Level::INFO, "checkout_diff");
             let _e = s.enter();
-            let to_frontiers = to.to_frontiers(&oplog.dag);
-            let from_frontiers = from.to_frontiers(&oplog.dag);
-            let (common_ancestors, _mode) = oplog
-                .dag
-                .find_common_ancestor(&from_frontiers, &to_frontiers);
-            let lca_vv = oplog.dag.frontiers_to_vv(&common_ancestors).unwrap();
-            let lca_frontiers = lca_vv.to_frontiers(&oplog.dag);
+            let mut dag = oplog.dag.try_lock().unwrap();
+            let to_frontiers = to.to_frontiers(&mut dag);
+            let from_frontiers = from.to_frontiers(&mut dag);
+            let (common_ancestors, _mode) =
+                dag.find_common_ancestor(&from_frontiers, &to_frontiers);
+            let lca_vv = dag.frontiers_to_vv(&common_ancestors).unwrap();
+            let lca_frontiers = lca_vv.to_frontiers(&mut dag);
             tracing::info!(
                 "from vv {:?} to vv {:?} current vv {:?} lca vv {:?}",
                 from,

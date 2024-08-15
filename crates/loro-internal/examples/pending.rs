@@ -14,7 +14,7 @@ pub fn main() {
             text.delete_with_txn(&mut txn, *pos, *del).unwrap();
             text.insert_with_txn(&mut txn, *pos, ins).unwrap();
             updates.push(loro.export_from(&latest_vv));
-            latest_vv = loro.oplog_vv();
+            latest_vv = (*loro.oplog_vv()).clone();
         }
     }
 

@@ -13,6 +13,7 @@ use std::{
 };
 
 use fxhash::{FxHashMap, FxHashSet};
+pub(crate) use iter::{DagCausalIter, IterReturn};
 use loro_common::IdSpanVector;
 use rle::{HasLength, Sliceable};
 use smallvec::{smallvec, SmallVec};
@@ -30,7 +31,7 @@ use crate::{
 };
 
 use self::{
-    iter::{iter_dag, iter_dag_with_vv, DagCausalIter, DagIterator, DagIteratorVV},
+    iter::{iter_dag, iter_dag_with_vv, DagIterator, DagIteratorVV},
     mermaid::dag_to_mermaid,
 };
 

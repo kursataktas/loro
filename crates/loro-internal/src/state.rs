@@ -773,7 +773,7 @@ impl DocState {
                 oplog,
                 &Default::default(),
                 Some(&Default::default()),
-                oplog.vv(),
+                &oplog.vv(),
                 Some(&frontiers),
                 Some(&|idx| !idx.is_unknown() && unknown_containers.contains(&idx)),
             );

@@ -108,7 +108,6 @@ impl Dag for AppDag {
     }
 
     fn get(&self, id: ID) -> Option<&Self::Node> {
-        self.lazy_load_node(id);
         let x = self.map.range(..=id).next_back()?;
         if x.1.contains_id(id) {
             Some(x.1)
@@ -118,7 +117,7 @@ impl Dag for AppDag {
     }
 
     fn vv(&self) -> VersionVector {
-        self.vv.clone()
+        (*self.vv).clone()
     }
 }
 
@@ -168,8 +167,8 @@ impl AppDag {
         a.partial_cmp(&b)
     }
 
-    pub fn get_lamport(&self, id: &ID) -> Option<Lamport> {
-        self.lazy_load_node(id);
+    pub fn get_lamport(&mut self, id: &ID) -> Option<Lamport> {
+        self.lazy_load_node(*id);
         self.get(*id).and_then(|node| {
             assert!(id.counter >= node.cnt);
             if node.cnt + node.len as Counter > id.counter {
@@ -180,7 +179,7 @@ impl AppDag {
         })
     }
 
-    pub fn get_change_lamport_from_deps(&self, deps: &[ID]) -> Option<Lamport> {
+    pub fn get_change_lamport_from_deps(&mut self, deps: &[ID]) -> Option<Lamport> {
         let mut lamport = 0;
         for id in deps.iter() {
             let x = self.get_lamport(id)?;
@@ -233,7 +232,7 @@ impl AppDag {
     }
 
     #[inline(always)]
-    pub fn vv_to_frontiers(&self, vv: &VersionVector) -> Frontiers {
+    pub fn vv_to_frontiers(&mut self, vv: &VersionVector) -> Frontiers {
         vv.to_frontiers(self)
     }
 

@@ -9,13 +9,13 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::Mutex;
-use tracing::{debug, trace};
+use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 use crate::change::{get_sys_timestamp, Change, Lamport, Timestamp};
 use crate::configure::Configure;
 use crate::container::list::list_op;
-use crate::dag::{Dag, DagUtils};
+use crate::dag::{Dag, DagCausalIter, DagNode, DagUtils, IterReturn};
 use crate::diff_calc::DiffMode;
 use crate::encoding::ParsedHeaderAndBody;
 use crate::encoding::{decode_oplog, encode_oplog, EncodeMode};
@@ -45,7 +45,7 @@ use super::arena::SharedArena;
 /// The causal graph should always be a DAG and complete. So we can always find the LCA.
 /// If deps are missing, we can't import the change. It will be put into the `pending_changes`.
 pub struct OpLog {
-    pub(crate) dag: AppDag,
+    pub(crate) dag: Arc<Mutex<AppDag>>,
     pub(crate) arena: SharedArena,
     change_store: ChangeStore,
     history_cache: Mutex<ContainerHistoryCache>,
@@ -69,9 +69,9 @@ pub struct AppDag {
     change_store: ChangeStore,
     pub(crate) map: BTreeMap<ID, AppDagNode>,
     pub(crate) frontiers: Frontiers,
-    pub(crate) vv: VersionVector,
+    pub(crate) vv: Arc<VersionVector>,
     /// Ops included in the version vector but not parsed yet
-    pub(crate) unparsed_vv: VersionVector,
+    pub(crate) unparsed_vv: Arc<VersionVector>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +99,7 @@ impl AppDag {
     }
 
     /// If the lamport of change can be calculated, return Ok, otherwise, Err
-    pub(crate) fn calc_unknown_lamport_change(&self, change: &mut Change) -> Result<(), ()> {
+    pub(crate) fn calc_unknown_lamport_change(&mut self, change: &mut Change) -> Result<(), ()> {
         for dep in change.deps.iter() {
             match self.get_lamport(dep) {
                 Some(lamport) => {
@@ -111,7 +111,7 @@ impl AppDag {
         Ok(())
     }
 
-    pub(crate) fn find_deps_of_id(&self, id: ID) -> Frontiers {
+    pub(crate) fn find_deps_of_id(&mut self, id: ID) -> Frontiers {
         self.lazy_load_node(id);
         let Some(node) = self.get(id) else {
             return Frontiers::default();
@@ -133,12 +133,15 @@ impl AppDag {
             .map(|(_, v)| v)
     }
 
-    fn update_frontiers(&mut self, id: ID, deps: &Frontiers) {
+    fn update_frontiers_and_vv(&mut self, id: ID, deps: &Frontiers) {
         self.frontiers.update_frontiers_on_new_change(id, deps);
+        self.extend_to_include_last_id(id);
     }
 
     fn lazy_load_last_of_peer(&mut self, peer: u64) {
-        todo!()
+        if self.unparsed_vv.get(&peer).is_some() {
+            todo!()
+        }
     }
 
     fn lazy_load_node(&mut self, id: ID) {
@@ -147,6 +150,10 @@ impl AppDag {
         }
 
         todo!("load dag node from kv store, from id -> unparsed_vv.get(peer)")
+    }
+
+    fn extend_to_include_last_id(&mut self, id: ID) {
+        Arc::make_mut(&mut self.vv).extend_to_include_last_id(id);
     }
 }
 
@@ -174,13 +181,13 @@ impl OpLog {
                 arena.clone(),
                 change_store.clone(),
             )),
-            dag: AppDag {
+            dag: Arc::new(Mutex::new(AppDag {
                 change_store: change_store.clone(),
                 map: BTreeMap::new(),
                 frontiers: Frontiers::default(),
-                vv: VersionVector::default(),
-                unparsed_vv: VersionVector::default(),
-            },
+                vv: Arc::new(VersionVector::default()),
+                unparsed_vv: Arc::new(VersionVector::default()),
+            })),
             change_store,
             arena,
             next_lamport: 0,
@@ -219,7 +226,7 @@ impl OpLog {
     }
 
     #[inline]
-    pub fn dag(&self) -> &AppDag {
+    pub fn dag(&self) -> &Arc<Mutex<AppDag>> {
         &self.dag
     }
 
@@ -252,7 +259,7 @@ impl OpLog {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dag.map.is_empty() && self.arena.can_import_snapshot()
+        self.dag.try_lock().unwrap().map.is_empty() && self.arena.can_import_snapshot()
     }
 
     /// This is the **only** place to update the `OpLog.changes`
@@ -305,7 +312,11 @@ impl OpLog {
         }
 
         if cfg!(debug_assertions) {
-            let lamport = self.dag.frontiers_to_next_lamport(&change.deps);
+            let lamport = self
+                .dag
+                .lock()
+                .unwrap()
+                .frontiers_to_next_lamport(&change.deps);
             assert_eq!(
                 lamport, change.lamport,
                 "{:#?}\nDAG={:#?}",
@@ -315,7 +326,6 @@ impl OpLog {
 
         self.next_lamport = self.next_lamport.max(change.lamport_end());
         self.latest_timestamp = self.latest_timestamp.max(change.timestamp);
-        self.dag.vv.extend_to_include_last_id(change.id_last());
         let mark = self.update_dag_on_new_change(&change);
         self.insert_new_change(change, mark);
         Ok(())
@@ -327,10 +337,11 @@ impl OpLog {
         change: &Change,
     ) -> EnsureDagNodeDepsAreAtTheEnd {
         let len = change.content_len();
-        self.dag.update_frontiers(change.id_last(), &change.deps);
+        let mut dag = self.dag.try_lock().unwrap();
+        dag.update_frontiers_and_vv(change.id_last(), &change.deps);
         if change.deps_on_self() {
             // don't need to push new element to dag because it only depends on itself
-            let last = self.dag.get_last_mut_of_peer(change.id.peer).unwrap();
+            let last = dag.get_last_mut_of_peer(change.id.peer).unwrap();
             assert_eq!(last.peer, change.id.peer, "peer id is not the same");
             assert_eq!(
                 last.cnt + last.len as Counter,
@@ -345,7 +356,7 @@ impl OpLog {
             last.len = (change.id.counter - last.cnt) as usize + len;
             last.has_succ = false;
         } else {
-            let vv = self.dag.frontiers_to_im_vv(&change.deps);
+            let vv = dag.frontiers_to_im_vv(&change.deps);
             let mut pushed = false;
             let node = AppDagNode {
                 vv: OnceCell::from(vv),
@@ -356,7 +367,7 @@ impl OpLog {
                 has_succ: false,
                 len,
             };
-            if let Some(last) = self.dag.get_last_mut_of_peer(change.id.peer) {
+            if let Some(last) = dag.get_last_mut_of_peer(change.id.peer) {
                 if change.id.counter > 0 {
                     assert_eq!(
                         last.ctr_end(),
@@ -372,11 +383,11 @@ impl OpLog {
             }
 
             if !pushed {
-                self.dag.map.insert(node.id_start(), node);
+                dag.map.insert(node.id_start(), node);
             }
 
             for dep in change.deps.iter() {
-                let target = self.dag.get_mut(*dep).unwrap();
+                let target = dag.get_mut(*dep).unwrap();
                 if target.ctr_last() == dep.counter {
                     target.has_succ = true;
                 } else {
@@ -386,7 +397,7 @@ impl OpLog {
                     let new_node =
                         target.slice(dep.counter as usize - target.cnt as usize, target.len);
                     target.len -= new_node.len;
-                    self.dag.map.insert(new_node.id_start(), new_node);
+                    dag.map.insert(new_node.id_start(), new_node);
                 }
             }
         }
@@ -396,7 +407,7 @@ impl OpLog {
 
     /// Trim the known part of change
     pub(crate) fn trim_the_known_part_of_change(&self, change: Change) -> Option<Change> {
-        let Some(&end) = self.dag.vv.get(&change.id.peer) else {
+        let Some(&end) = self.dag.try_lock().unwrap().vv.get(&change.id.peer) else {
             return Some(change);
         };
 
@@ -413,7 +424,14 @@ impl OpLog {
     }
 
     fn check_id_is_not_duplicated(&self, id: ID) -> Result<(), LoroError> {
-        let cur_end = self.dag.vv.get(&id.peer).cloned().unwrap_or(0);
+        let cur_end = self
+            .dag
+            .lock()
+            .unwrap()
+            .vv
+            .get(&id.peer)
+            .cloned()
+            .unwrap_or(0);
         if cur_end > id.counter {
             return Err(LoroError::UsedOpID { id });
         }
@@ -423,7 +441,7 @@ impl OpLog {
 
     fn check_deps(&self, deps: &Frontiers) -> Result<(), ID> {
         for dep in deps.iter() {
-            if !self.dag.vv.includes_id(*dep) {
+            if !self.dag.try_lock().unwrap().vv.includes_id(*dep) {
                 return Err(*dep);
             }
         }
@@ -432,23 +450,30 @@ impl OpLog {
     }
 
     pub(crate) fn next_id(&self, peer: PeerID) -> ID {
-        let cnt = self.dag.vv.get(&peer).copied().unwrap_or(0);
+        let cnt = self
+            .dag
+            .try_lock()
+            .unwrap()
+            .vv
+            .get(&peer)
+            .copied()
+            .unwrap_or(0);
         ID::new(peer, cnt)
     }
 
-    pub(crate) fn vv(&self) -> &VersionVector {
-        &self.dag.vv
+    pub(crate) fn vv(&self) -> Arc<VersionVector> {
+        self.dag.try_lock().unwrap().vv.clone()
     }
 
-    pub(crate) fn frontiers(&self) -> &Frontiers {
-        &self.dag.frontiers
+    pub(crate) fn frontiers(&self) -> Frontiers {
+        self.dag.try_lock().unwrap().frontiers.clone()
     }
 
     /// - Ordering::Less means self is less than target or parallel
     /// - Ordering::Equal means versions equal
     /// - Ordering::Greater means self's version is greater than target
     pub fn cmp_with_frontiers(&self, other: &Frontiers) -> Ordering {
-        self.dag.cmp_with_frontiers(other)
+        self.dag.try_lock().unwrap().cmp_with_frontiers(other)
     }
 
     /// Compare two [Frontiers] causally.
@@ -460,7 +485,7 @@ impl OpLog {
         a: &Frontiers,
         b: &Frontiers,
     ) -> Result<Option<Ordering>, FrontiersNotIncluded> {
-        self.dag.cmp_frontiers(a, b)
+        self.dag.try_lock().unwrap().cmp_frontiers(a, b)
     }
 
     pub(crate) fn get_min_lamport_at(&self, id: ID) -> Lamport {
@@ -509,7 +534,7 @@ impl OpLog {
         &mut self,
         remote_changes: Vec<Change>,
     ) -> Result<(), LoroError> {
-        let latest_vv = self.dag.vv.clone();
+        let latest_vv = self.dag.try_lock().unwrap().vv.clone();
         self.extend_pending_changes_with_unknown_lamport(remote_changes, &latest_vv);
         Ok(())
     }
@@ -556,32 +581,23 @@ impl OpLog {
     /// You can trim it by the provided counter value. It should start with the counter.
     ///
     /// If frontiers are provided, it will be faster (because we don't need to calculate it from version vector
-    pub(crate) fn iter_from_lca_causally(
+    pub(crate) fn iter_from_lca_causally<U>(
         &self,
         from: &VersionVector,
         from_frontiers: Option<&Frontiers>,
         to: &VersionVector,
         to_frontiers: Option<&Frontiers>,
-    ) -> (
-        VersionVector,
-        DiffMode,
-        impl Iterator<
-                Item = (
-                    BlockChangeRef,
-                    (Counter, Counter),
-                    Rc<RefCell<VersionVector>>,
-                ),
-            > + '_,
-    ) {
+        f: impl FnOnce(VersionVector, DiffMode, ChangeIterator<'_, DagCausalIter<AppDag>>) -> U,
+    ) -> U {
         let mut merged_vv = from.clone();
         merged_vv.merge(to);
         let from_frontiers_inner;
         let to_frontiers_inner;
-
+        let mut dag = self.dag.try_lock().unwrap();
         let from_frontiers = match from_frontiers {
             Some(f) => f,
             None => {
-                from_frontiers_inner = Some(from.to_frontiers(&self.dag));
+                from_frontiers_inner = Some(from.to_frontiers(&mut dag));
                 from_frontiers_inner.as_ref().unwrap()
             }
         };
@@ -589,7 +605,7 @@ impl OpLog {
         let to_frontiers = match to_frontiers {
             Some(t) => t,
             None => {
-                to_frontiers_inner = Some(to.to_frontiers(&self.dag));
+                to_frontiers_inner = Some(to.to_frontiers(&mut dag));
                 to_frontiers_inner.as_ref().unwrap()
             }
         };
@@ -597,51 +613,35 @@ impl OpLog {
         debug!("from_frontiers={:?} vv={:?}", &from_frontiers, from);
         debug!("to_frontiers={:?} vv={:?}", &to_frontiers, to);
         let (common_ancestors, mut diff_mode) =
-            self.dag.find_common_ancestor(from_frontiers, to_frontiers);
+            dag.find_common_ancestor(from_frontiers, to_frontiers);
         if diff_mode == DiffMode::Checkout && to > from {
             diff_mode = DiffMode::Import;
         }
 
-        let common_ancestors_vv = self.dag.frontiers_to_vv(&common_ancestors).unwrap();
+        let common_ancestors_vv = self
+            .dag
+            .lock()
+            .unwrap()
+            .frontiers_to_vv(&common_ancestors)
+            .unwrap();
         // go from lca to merged_vv
         let diff = common_ancestors_vv.diff(&merged_vv).right;
-        let mut iter = self.dag.iter_causal(&common_ancestors, diff);
-        let mut node = iter.next();
-        let mut cur_cnt = 0;
+        let mut iter = dag.iter_causal(&common_ancestors, diff);
+        let node = iter.next();
+        let cur_cnt = 0;
         let vv = Rc::new(RefCell::new(VersionVector::default()));
-        (
+        f(
             common_ancestors_vv.clone(),
             diff_mode,
-            std::iter::from_fn(move || {
-                if let Some(inner) = &node {
-                    let mut inner_vv = vv.borrow_mut();
-                    // FIXME: PERF: it looks slow for large vv, like 10000+ entries
-                    inner_vv.clear();
-                    inner_vv.extend_to_include_vv(inner.data.vv.get().unwrap().iter());
-                    let peer = inner.data.peer;
-                    let cnt = inner
-                        .data
-                        .cnt
-                        .max(cur_cnt)
-                        .max(common_ancestors_vv.get(&peer).copied().unwrap_or(0));
-                    let dag_node_end = (inner.data.cnt + inner.data.len as Counter)
-                        .min(merged_vv.get(&peer).copied().unwrap_or(0));
-                    let change = self.change_store.get_change(ID::new(peer, cnt)).unwrap();
-
-                    if change.ctr_end() < dag_node_end {
-                        cur_cnt = change.ctr_end();
-                    } else {
-                        node = iter.next();
-                        cur_cnt = 0;
-                    }
-
-                    inner_vv.extend_to_include_end_id(change.id);
-
-                    Some((change, (cnt, dag_node_end), vv.clone()))
-                } else {
-                    None
-                }
-            }),
+            ChangeIterator {
+                iter,
+                node,
+                vv,
+                cur_cnt,
+                common_ancestors_vv: &common_ancestors_vv,
+                merged_vv: &merged_vv,
+                change_store: &self.change_store,
+            },
         )
     }
 
@@ -653,7 +653,7 @@ impl OpLog {
         let mut total_changes = 0;
         let mut total_ops = 0;
         let mut total_atom_ops = 0;
-        let total_dag_node = self.dag.map.len();
+        let total_dag_node = self.dag.try_lock().unwrap().map.len();
         self.change_store.visit_all_changes(&mut |change| {
             total_changes += 1;
             total_ops += change.ops.len();
@@ -734,7 +734,8 @@ impl OpLog {
 
         while counter < span_end {
             let id = ID::new(peer, counter);
-            let node = self.dag.get(id).unwrap();
+            let app_dag = &self.dag.try_lock().unwrap();
+            let node = app_dag.get(id).unwrap();
 
             let f = if node.cnt == counter {
                 node.deps.clone()
@@ -755,13 +756,67 @@ impl OpLog {
 
     #[inline]
     pub fn compact_change_store(&mut self) {
-        self.change_store
-            .flush_and_compact(&self.dag.vv, &self.dag.frontiers);
+        self.change_store.flush_and_compact(
+            &self.dag.try_lock().unwrap().vv,
+            &self.dag.try_lock().unwrap().frontiers,
+        );
     }
 
     #[inline]
     pub fn change_store_kv_size(&self) -> usize {
         self.change_store.kv_size()
+    }
+}
+
+pub(crate) struct ChangeIterator<'a, I> {
+    iter: I,
+    node: Option<IterReturn<'a, AppDagNode>>,
+    vv: Rc<RefCell<VersionVector>>,
+    cur_cnt: Counter,
+    common_ancestors_vv: &'a VersionVector,
+    merged_vv: &'a VersionVector,
+    change_store: &'a ChangeStore,
+}
+
+impl<'a, I> Iterator for ChangeIterator<'a, I>
+where
+    I: Iterator<Item = IterReturn<'a, AppDagNode>>,
+{
+    type Item = (
+        BlockChangeRef,
+        (Counter, Counter),
+        Rc<RefCell<VersionVector>>,
+    );
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(inner) = &self.node {
+            let mut inner_vv = self.vv.borrow_mut();
+            // FIXME: PERF: it looks slow for large vv, like 10000+ entries
+            inner_vv.clear();
+            inner_vv.extend_to_include_vv(inner.data.vv.get().unwrap().iter());
+            let peer = inner.data.peer;
+            let cnt = inner
+                .data
+                .cnt
+                .max(self.cur_cnt)
+                .max(self.common_ancestors_vv.get(&peer).copied().unwrap_or(0));
+            let dag_node_end = (inner.data.cnt + inner.data.len as Counter)
+                .min(self.merged_vv.get(&peer).copied().unwrap_or(0));
+            let change = self.change_store.get_change(ID::new(peer, cnt)).unwrap();
+
+            if change.ctr_end() < dag_node_end {
+                self.cur_cnt = change.ctr_end();
+            } else {
+                self.node = self.iter.next();
+                self.cur_cnt = 0;
+            }
+
+            inner_vv.extend_to_include_end_id(change.id);
+
+            Some((change, (cnt, dag_node_end), self.vv.clone()))
+        } else {
+            None
+        }
     }
 }
 

@@ -52,7 +52,7 @@ impl<T: ActorTrait> ActorGroup<T> {
                     self.docs[*to].doc().import(&data).unwrap();
                 }
                 bench_utils::SyncKind::OnlyLastOpFromEachPeer => {
-                    let mut vv = self.docs[*from].doc().oplog_vv();
+                    let mut vv = (*self.docs[*from].doc().oplog_vv()).clone();
                     for cnt in vv.values_mut() {
                         *cnt -= 1;
                     }

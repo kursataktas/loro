@@ -4,6 +4,7 @@ use std::{
     cmp::Ordering,
     iter,
     ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
 };
 
 use fxhash::{FxHashMap, FxHashSet};
@@ -84,7 +85,7 @@ impl ImVersionVector {
     /// # Panic
     ///
     /// When self is greater than dag.vv
-    pub fn to_frontiers(&self, dag: &AppDag) -> Frontiers {
+    pub fn to_frontiers(&self, dag: &mut AppDag) -> Frontiers {
         let last_ids: Vec<ID> = self
             .iter()
             .filter_map(|(client_id, cnt)| {
@@ -885,7 +886,7 @@ impl VersionVector {
     /// # Panic
     ///
     /// When self is greater than dag.vv
-    pub fn to_frontiers(&self, dag: &AppDag) -> Frontiers {
+    pub fn to_frontiers(&self, dag: &mut AppDag) -> Frontiers {
         let last_ids: Vec<ID> = self
             .iter()
             .filter_map(|(client_id, cnt)| {
@@ -919,7 +920,7 @@ impl VersionVector {
 }
 
 /// Use minimal set of ids to represent the frontiers
-fn shrink_frontiers(mut last_ids: Vec<ID>, dag: &AppDag) -> Frontiers {
+fn shrink_frontiers(mut last_ids: Vec<ID>, dag: &mut AppDag) -> Frontiers {
     // it only keep the ids of ops that are concurrent to each other
 
     let mut frontiers = Frontiers::default();

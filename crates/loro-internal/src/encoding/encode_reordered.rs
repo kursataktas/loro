@@ -117,6 +117,8 @@ pub(crate) fn encode_updates(oplog: &OpLog, vv: &VersionVector) -> Vec<u8> {
 
     let frontiers = oplog
         .dag
+        .lock()
+        .unwrap()
         .vv_to_frontiers(&actual_start_vv)
         .iter()
         .map(|x| (registers.peer.register(&x.peer), x.counter))
@@ -231,7 +233,12 @@ pub(crate) fn import_changes_to_oplog(
 
         latest_ids.push(change.id_last());
         // calc lamport or pending if its deps are not satisfied
-        match oplog.dag.get_change_lamport_from_deps(&change.deps) {
+        match oplog
+            .dag
+            .lock()
+            .unwrap()
+            .get_change_lamport_from_deps(&change.deps)
+        {
             Some(lamport) => change.lamport = lamport,
             None => {
                 pending_changes.push(change);
@@ -246,10 +253,6 @@ pub(crate) fn import_changes_to_oplog(
         let mark = oplog.update_dag_on_new_change(&change);
         oplog.next_lamport = oplog.next_lamport.max(change.lamport_end());
         oplog.latest_timestamp = oplog.latest_timestamp.max(change.timestamp);
-        oplog.dag.vv.extend_to_include_end_id(ID {
-            peer: change.id.peer,
-            counter: change.id.counter + change.atom_len() as Counter,
-        });
         oplog.insert_new_change(change, mark);
     }
 
@@ -408,7 +411,7 @@ fn extract_ops(
 
 pub(crate) fn encode_snapshot(oplog: &OpLog, state: &mut DocState, vv: &VersionVector) -> Vec<u8> {
     assert!(!state.is_in_txn());
-    assert_eq!(oplog.frontiers(), &state.frontiers);
+    assert_eq!(&oplog.frontiers(), &state.frontiers);
 
     let mut peer_register: ValueRegister<PeerID> = ValueRegister::new();
     let (start_counters, diff_changes) = init_encode(oplog, vv, &mut peer_register);
@@ -670,7 +673,7 @@ pub(crate) fn decode_snapshot(doc: &LoroDoc, bytes: &[u8]) -> LoroResult<()> {
 
     decode_snapshot_states(
         &mut state,
-        oplog.frontiers().clone(),
+        oplog.frontiers(),
         iter.states,
         containers,
         state_blob_arena,
@@ -1071,11 +1074,11 @@ mod encode {
         peer_register: &mut ValueRegister<PeerID>,
     ) -> (Vec<i32>, Vec<Either<Change, BlockChangeRef>>) {
         let self_vv = oplog.vv();
-        let start_vv = vv.trim(oplog.vv());
+        let start_vv = vv.trim(&oplog.vv());
         let mut start_counters = Vec::new();
 
         let mut diff_changes: Vec<Either<Change, BlockChangeRef>> = Vec::new();
-        for change in oplog.iter_changes_peer_by_peer(&start_vv, self_vv) {
+        for change in oplog.iter_changes_peer_by_peer(&start_vv, &self_vv) {
             let start_cnt = start_vv.get(&change.id.peer).copied().unwrap_or(0);
             if !peer_register.contains(&change.id.peer) {
                 peer_register.register(&change.id.peer);

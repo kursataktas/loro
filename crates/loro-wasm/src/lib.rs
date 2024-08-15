@@ -814,7 +814,8 @@ impl Loro {
     /// If you checkout to a specific version, the version vector will not change.
     #[wasm_bindgen(js_name = "oplogVersion")]
     pub fn oplog_version(&self) -> VersionVector {
-        VersionVector(self.0.oplog_vv())
+        // PERF: can be optimized
+        VersionVector((*self.0.oplog_vv()).clone())
     }
 
     /// Get the frontiers of the current document.
@@ -1253,9 +1254,8 @@ impl Loro {
         let frontiers = ids_to_frontiers(frontiers)?;
         let borrow_mut = &self.0;
         let oplog = borrow_mut.oplog().try_lock().unwrap();
-        oplog
-            .dag()
-            .frontiers_to_vv(&frontiers)
+        let dag = oplog.dag().lock().unwrap();
+        dag.frontiers_to_vv(&frontiers)
             .map(VersionVector)
             .ok_or_else(|| JsError::new("Frontiers not found").into())
     }
@@ -1274,7 +1274,15 @@ impl Loro {
     /// ```
     #[wasm_bindgen(js_name = "vvToFrontiers")]
     pub fn vv_to_frontiers(&self, vv: &VersionVector) -> JsResult<JsIDs> {
-        let f = self.0.oplog().lock().unwrap().dag().vv_to_frontiers(&vv.0);
+        let f = self
+            .0
+            .oplog()
+            .lock()
+            .unwrap()
+            .dag()
+            .lock()
+            .unwrap()
+            .vv_to_frontiers(&vv.0);
         Ok(frontiers_to_ids(&f))
     }
 

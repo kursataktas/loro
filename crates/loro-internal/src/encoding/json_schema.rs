@@ -48,7 +48,7 @@ pub(crate) fn export_json<'a, 'c: 'a>(
     let actual_start_vv = refine_vv(start_vv, oplog);
     let actual_end_vv = refine_vv(end_vv, oplog);
 
-    let frontiers = oplog.dag.vv_to_frontiers(&actual_start_vv);
+    let frontiers = oplog.dag.try_lock().unwrap().vv_to_frontiers(&actual_start_vv);
 
     let mut peer_register = ValueRegister::<PeerID>::new();
     let diff_changes = init_encode(oplog, &actual_start_vv, &actual_end_vv);

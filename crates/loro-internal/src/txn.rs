@@ -249,7 +249,11 @@ impl Transaction {
         let frontiers = state_lock.frontiers.clone();
         let peer = state_lock.peer.load(std::sync::atomic::Ordering::Relaxed);
         let next_counter = oplog_lock.next_id(peer).counter;
-        let next_lamport = oplog_lock.dag.frontiers_to_next_lamport(&frontiers);
+        let next_lamport = oplog_lock
+            .dag
+            .lock()
+            .unwrap()
+            .frontiers_to_next_lamport(&frontiers);
         drop(state_lock);
         drop(oplog_lock);
         Self {
@@ -353,7 +357,7 @@ impl Transaction {
                         })
                         .collect(),
                 ),
-                new_version: Cow::Borrowed(oplog.frontiers()),
+                new_version: Cow::Owned(oplog.frontiers()),
             }),
         );
         drop(state);

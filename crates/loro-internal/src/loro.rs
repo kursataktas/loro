@@ -507,7 +507,7 @@ impl LoroDoc {
                     decode_snapshot(&app, parsed.mode, parsed.body)?;
                     let oplog = self.oplog.lock().unwrap();
                     // TODO: PERF: the ser and de can be optimized out
-                    let updates = app.export_from(oplog.vv());
+                    let updates = app.export_from(&oplog.vv());
                     drop(oplog);
 
                     return self.import_with(&updates, origin);
@@ -534,8 +534,8 @@ impl LoroDoc {
                 &oplog,
                 &old_vv,
                 Some(&old_frontiers),
-                oplog.vv(),
-                Some(oplog.dag.get_frontiers()),
+                &oplog.vv(),
+                Some(oplog.dag.try_lock().unwrap().get_frontiers()),
                 None,
             );
             let mut state = self.state.lock().unwrap();
@@ -570,8 +570,8 @@ impl LoroDoc {
                 &oplog,
                 &old_vv,
                 Some(&old_frontiers),
-                oplog.vv(),
-                Some(oplog.dag.get_frontiers()),
+                &oplog.vv(),
+                Some(oplog.dag.try_lock().unwrap().get_frontiers()),
                 None,
             );
             let mut state = self.state.lock().unwrap();
@@ -644,7 +644,7 @@ impl LoroDoc {
 
     /// Get the version vector of the current OpLog
     #[inline]
-    pub fn oplog_vv(&self) -> VersionVector {
+    pub fn oplog_vv(&self) -> Arc<VersionVector> {
         self.oplog.lock().unwrap().vv().clone()
     }
 
@@ -652,7 +652,14 @@ impl LoroDoc {
     #[inline]
     pub fn state_vv(&self) -> VersionVector {
         let f = &self.state.lock().unwrap().frontiers;
-        self.oplog.lock().unwrap().dag.frontiers_to_vv(f).unwrap()
+        self.oplog
+            .lock()
+            .unwrap()
+            .dag
+            .lock()
+            .unwrap()
+            .frontiers_to_vv(f)
+            .unwrap()
     }
 
     pub fn get_by_path(&self, path: &[Index]) -> Option<ValueOrHandler> {
@@ -870,12 +877,12 @@ impl LoroDoc {
             // check whether a and b are valid
             let oplog = self.oplog.lock().unwrap();
             for &id in a.iter() {
-                if !oplog.dag.contains(id) {
+                if !oplog.dag.try_lock().unwrap().contains(id) {
                     return Err(LoroError::FrontiersNotFound(id));
                 }
             }
             for &id in b.iter() {
-                if !oplog.dag.contains(id) {
+                if !oplog.dag.try_lock().unwrap().contains(id) {
                     return Err(LoroError::FrontiersNotFound(id));
                 }
             }
@@ -1084,13 +1091,18 @@ impl LoroDoc {
         self.detached.store(true, Release);
         let mut calc = self.diff_calculator.lock().unwrap();
         for &i in frontiers.iter() {
-            if !oplog.dag.contains(i) {
+            if !oplog.dag.try_lock().unwrap().contains(i) {
                 return Err(LoroError::FrontiersNotFound(i));
             }
         }
 
-        let before = &oplog.dag.frontiers_to_vv(&state.frontiers).unwrap();
-        let Some(after) = &oplog.dag.frontiers_to_vv(frontiers) else {
+        let before = &oplog
+            .dag
+            .lock()
+            .unwrap()
+            .frontiers_to_vv(&state.frontiers)
+            .unwrap();
+        let Some(after) = &oplog.dag.try_lock().unwrap().frontiers_to_vv(frontiers) else {
             return Err(LoroError::NotFoundError(
                 format!("Cannot find the specified version {:?}", frontiers).into_boxed_str(),
             ));
@@ -1114,12 +1126,24 @@ impl LoroDoc {
 
     #[inline]
     pub fn vv_to_frontiers(&self, vv: &VersionVector) -> Frontiers {
-        self.oplog.lock().unwrap().dag.vv_to_frontiers(vv)
+        self.oplog
+            .lock()
+            .unwrap()
+            .dag
+            .lock()
+            .unwrap()
+            .vv_to_frontiers(vv)
     }
 
     #[inline]
     pub fn frontiers_to_vv(&self, frontiers: &Frontiers) -> Option<VersionVector> {
-        self.oplog.lock().unwrap().dag.frontiers_to_vv(frontiers)
+        self.oplog
+            .lock()
+            .unwrap()
+            .dag
+            .lock()
+            .unwrap()
+            .frontiers_to_vv(frontiers)
     }
 
     /// Import ops from other doc.
@@ -1230,15 +1254,21 @@ impl LoroDoc {
                 // We know where the target id is when we trace back to the delete_op_id.
                 let delete_op_id = find_last_delete_op(&oplog, id, idx).unwrap();
                 let mut diff_calc = DiffCalculator::new(false);
-                let before_frontiers: Frontiers = oplog.dag.find_deps_of_id(delete_op_id);
-                let before = &oplog.dag.frontiers_to_vv(&before_frontiers).unwrap();
+                let before_frontiers: Frontiers =
+                    oplog.dag.try_lock().unwrap().find_deps_of_id(delete_op_id);
+                let before = &oplog
+                    .dag
+                    .lock()
+                    .unwrap()
+                    .frontiers_to_vv(&before_frontiers)
+                    .unwrap();
                 // TODO: PERF: it doesn't need to calc the effects here
                 diff_calc.calc_diff_internal(
                     &oplog,
                     before,
                     Some(&before_frontiers),
-                    &oplog.dag.vv,
-                    Some(&oplog.dag.frontiers),
+                    &oplog.dag.try_lock().unwrap().vv,
+                    Some(&oplog.dag.try_lock().unwrap().frontiers),
                     Some(&|target| idx == target),
                 );
                 // TODO: remove depth info
@@ -1375,8 +1405,13 @@ impl LoroDoc {
 }
 
 fn find_last_delete_op(oplog: &OpLog, id: ID, idx: ContainerIdx) -> Option<ID> {
-    let start_vv = oplog.dag.frontiers_to_vv(&id.into()).unwrap();
-    for change in oplog.iter_changes_causally_rev(&start_vv, &oplog.dag.vv) {
+    let start_vv = oplog
+        .dag
+        .lock()
+        .unwrap()
+        .frontiers_to_vv(&id.into())
+        .unwrap();
+    for change in oplog.iter_changes_causally_rev(&start_vv, &oplog.dag.try_lock().unwrap().vv) {
         for op in change.ops.iter().rev() {
             if op.container != idx {
                 continue;

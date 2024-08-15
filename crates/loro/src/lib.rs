@@ -373,7 +373,7 @@ impl LoroDoc {
 
     /// Get the `VersionVector` version of `OpLog`
     #[inline]
-    pub fn oplog_vv(&self) -> VersionVector {
+    pub fn oplog_vv(&self) -> Arc<VersionVector> {
         self.doc.oplog_vv()
     }
 

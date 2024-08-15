@@ -178,101 +178,113 @@ impl DiffCalculator {
             let mut merged = before.clone();
             merged.merge(after);
 
-            let (lca, mut diff_mode, iter) =
-                oplog.iter_from_lca_causally(before, before_frontiers, after, after_frontiers);
+            oplog.iter_from_lca_causally(
+                before,
+                before_frontiers,
+                after,
+                after_frontiers,
+                |lca, mut diff_mode, iter| {
+                    if let DiffCalculatorRetainMode::Persist { has_all, last_vv } =
+                        &mut self.retain_mode
+                    {
+                        if before.is_empty() {
+                            *has_all = true;
+                            *last_vv = Default::default();
+                        }
+                        diff_mode = DiffMode::Checkout;
+                    }
 
-            if let DiffCalculatorRetainMode::Persist { has_all, last_vv } = &mut self.retain_mode {
-                if before.is_empty() {
-                    *has_all = true;
-                    *last_vv = Default::default();
-                }
-                diff_mode = DiffMode::Checkout;
-            }
+                    tracing::debug!("LCA: {:?} mode={:?}", &lca, diff_mode);
+                    let mut started_set = FxHashSet::default();
+                    for (change, (start_counter, end_counter), vv) in iter {
+                        if let DiffCalculatorRetainMode::Persist { has_all, last_vv } =
+                            &mut self.retain_mode
+                        {
+                            if *has_all {
+                                if change.id.counter > 0 {
+                                    debug_assert!(
+                                        last_vv.includes_id(change.id.inc(-1)),
+                                        "{:?} {}",
+                                        &last_vv,
+                                        change.id
+                                    );
+                                }
 
-            tracing::debug!("LCA: {:?} mode={:?}", &lca, diff_mode);
-            let mut started_set = FxHashSet::default();
-            for (change, (start_counter, end_counter), vv) in iter {
-                if let DiffCalculatorRetainMode::Persist { has_all, last_vv } =
-                    &mut self.retain_mode
-                {
-                    if *has_all {
-                        if change.id.counter > 0 {
-                            debug_assert!(
-                                last_vv.includes_id(change.id.inc(-1)),
-                                "{:?} {}",
-                                &last_vv,
-                                change.id
-                            );
+                                last_vv
+                                    .extend_to_include_end_id(ID::new(change.id.peer, end_counter));
+                            }
                         }
 
-                        last_vv.extend_to_include_end_id(ID::new(change.id.peer, end_counter));
-                    }
-                }
+                        let iter_start = change
+                            .ops
+                            .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
+                            .unwrap_or_else(|e| e);
+                        let mut visited = FxHashSet::default();
+                        for mut op in &change.ops.vec()[iter_start..] {
+                            if op.counter >= end_counter {
+                                break;
+                            }
 
-                let iter_start = change
-                    .ops
-                    .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
-                    .unwrap_or_else(|e| e);
-                let mut visited = FxHashSet::default();
-                for mut op in &change.ops.vec()[iter_start..] {
-                    if op.counter >= end_counter {
-                        break;
-                    }
+                            let idx = op.container;
+                            if let Some(filter) = container_filter {
+                                if !filter(idx) {
+                                    continue;
+                                }
+                            }
 
-                    let idx = op.container;
-                    if let Some(filter) = container_filter {
-                        if !filter(idx) {
-                            continue;
+                            // slice the op if needed
+                            // PERF: we can skip the slice by using the RichOp::new_slice
+                            let stack_sliced_op;
+                            if op.ctr_last() < start_counter {
+                                continue;
+                            }
+
+                            if op.counter < start_counter || op.ctr_end() > end_counter {
+                                stack_sliced_op = Some(op.slice(
+                                    (start_counter as usize).saturating_sub(op.counter as usize),
+                                    op.atom_len().min((end_counter - op.counter) as usize),
+                                ));
+                                op = stack_sliced_op.as_ref().unwrap();
+                            }
+
+                            trace!("opid = {}@{}", op.counter, change.id.peer);
+                            let vv = &mut vv.borrow_mut();
+                            vv.extend_to_include_end_id(ID::new(change.peer(), op.counter));
+                            let container = op.container;
+                            let depth = oplog.arena.get_depth(container);
+                            let (old_depth, calculator) = self.get_or_create_calc(container, depth);
+                            // checkout use the same diff_calculator, the depth of calculator is not updated
+                            // That may cause the container to be considered deleted
+                            if *old_depth != depth {
+                                *old_depth = depth;
+                            }
+
+                            if !started_set.contains(&op.container) {
+                                started_set.insert(container);
+                                calculator.start_tracking(oplog, &lca, diff_mode);
+                            }
+
+                            if visited.contains(&op.container) {
+                                // don't checkout if we have already checked out this container in this round
+                                calculator.apply_change(
+                                    oplog,
+                                    RichOp::new_by_change(&change, op),
+                                    None,
+                                );
+                            } else {
+                                calculator.apply_change(
+                                    oplog,
+                                    RichOp::new_by_change(&change, op),
+                                    Some(vv),
+                                );
+                                visited.insert(container);
+                            }
                         }
                     }
 
-                    // slice the op if needed
-                    // PERF: we can skip the slice by using the RichOp::new_slice
-                    let stack_sliced_op;
-                    if op.ctr_last() < start_counter {
-                        continue;
-                    }
-
-                    if op.counter < start_counter || op.ctr_end() > end_counter {
-                        stack_sliced_op = Some(op.slice(
-                            (start_counter as usize).saturating_sub(op.counter as usize),
-                            op.atom_len().min((end_counter - op.counter) as usize),
-                        ));
-                        op = stack_sliced_op.as_ref().unwrap();
-                    }
-
-                    trace!("opid = {}@{}", op.counter, change.id.peer);
-                    let vv = &mut vv.borrow_mut();
-                    vv.extend_to_include_end_id(ID::new(change.peer(), op.counter));
-                    let container = op.container;
-                    let depth = oplog.arena.get_depth(container);
-                    let (old_depth, calculator) = self.get_or_create_calc(container, depth);
-                    // checkout use the same diff_calculator, the depth of calculator is not updated
-                    // That may cause the container to be considered deleted
-                    if *old_depth != depth {
-                        *old_depth = depth;
-                    }
-
-                    if !started_set.contains(&op.container) {
-                        started_set.insert(container);
-                        calculator.start_tracking(oplog, &lca, diff_mode);
-                    }
-
-                    if visited.contains(&op.container) {
-                        // don't checkout if we have already checked out this container in this round
-                        calculator.apply_change(oplog, RichOp::new_by_change(&change, op), None);
-                    } else {
-                        calculator.apply_change(
-                            oplog,
-                            RichOp::new_by_change(&change, op),
-                            Some(vv),
-                        );
-                        visited.insert(container);
-                    }
-                }
-            }
-
-            Some(started_set)
+                    Some(started_set)
+                },
+            )
         } else {
             // We can calculate the diff by the current calculators.
 
