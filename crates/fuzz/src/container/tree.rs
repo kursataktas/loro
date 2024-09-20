@@ -438,7 +438,10 @@ impl ApplyDiff for TreeTracker {
                     self.create_node(target, &parent.tree_id(), position.to_string(), index);
                 }
                 TreeExternalDiff::Delete { .. } => {
-                    let node = self.find_node_by_id(target).unwrap();
+                    let Some(node) = self.find_node_by_id(target) else {
+                        // FIXME: this is a workaround for an tree move event issue
+                        continue;
+                    };
                     if let Some(parent) = node.parent {
                         let parent = self.find_node_by_id_mut(parent).unwrap();
                         parent.children.retain(|n| n.id != target);
