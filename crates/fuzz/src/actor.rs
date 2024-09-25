@@ -190,7 +190,7 @@ impl Actor {
             let from = &self.loro.state_frontiers();
             let to = &f;
             let peer = self.peer;
-            tracing::info_span!("FuzzCheckout", ?from, ?to, ?peer).in_scope(|| {
+            tracing::info_span!("CheckHistoryCheckout", ?from, ?to, ?peer).in_scope(|| {
                 match self.loro.checkout(&f) {
                     Ok(_) => {}
                     Err(LoroError::SwitchToTrimmedVersion) => {

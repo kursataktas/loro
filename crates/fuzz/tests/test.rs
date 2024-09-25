@@ -9409,6 +9409,96 @@ fn fast_snapshot_5() {
 }
 
 #[test]
+fn fuzz_0() {
+    test_multi_sites(
+        5,
+        vec![FuzzTarget::All],
+        &mut [
+            Handle {
+                site: 49,
+                target: 93,
+                container: 249,
+                action: Generic(GenericAction {
+                    value: Container(Unknown(242)),
+                    bool: false,
+                    key: 4076008178,
+                    pos: 3659970553937384436,
+                    length: 18446743563195720639,
+                    prop: 4268070198080110592,
+                }),
+            },
+            Handle {
+                site: 59,
+                target: 59,
+                container: 59,
+                action: Generic(GenericAction {
+                    value: I32(15104),
+                    bool: true,
+                    key: 3881787,
+                    pos: 18392203053810515968,
+                    length: 18446744073709551615,
+                    prop: 4268070197459419135,
+                }),
+            },
+            Handle {
+                site: 0,
+                target: 0,
+                container: 59,
+                action: Generic(GenericAction {
+                    value: I32(-1),
+                    bool: true,
+                    key: 4294967295,
+                    pos: 4268071042561285376,
+                    length: 16672149208775483,
+                    prop: 4268070196452801339,
+                }),
+            },
+            SyncAll,
+            Handle {
+                site: 59,
+                target: 59,
+                container: 0,
+                action: Generic(GenericAction {
+                    value: I32(-50373),
+                    bool: true,
+                    key: 4294967295,
+                    pos: 4268070196469563391,
+                    length: 18446744073709551422,
+                    prop: 18446744073709551615,
+                }),
+            },
+            Handle {
+                site: 0,
+                target: 0,
+                container: 59,
+                action: Generic(GenericAction {
+                    value: I32(-1),
+                    bool: true,
+                    key: 4294967295,
+                    pos: 4268071042561285376,
+                    length: 16672149208775483,
+                    prop: 4268070196452801339,
+                }),
+            },
+            SyncAll,
+            Handle {
+                site: 59,
+                target: 59,
+                container: 59,
+                action: Generic(GenericAction {
+                    value: I32(15104),
+                    bool: true,
+                    key: 3881791,
+                    pos: 4467289359669788671,
+                    length: 18391574978261417983,
+                    prop: 18446744073709551615,
+                }),
+            },
+        ],
+    )
+}
+
+#[test]
 fn gc_fuzz() {
     test_multi_sites_with_gc(
         5,
@@ -11411,7 +11501,7 @@ fn gc_fuzz_25() {
 fn minify() {
     minify_error(
         5,
-        |n, actions| test_multi_sites_with_gc(n, vec![FuzzTarget::All], actions),
+        |n, actions| test_multi_sites(n, vec![FuzzTarget::All], actions),
         |_, actions| actions.to_vec(),
         vec![],
     )
