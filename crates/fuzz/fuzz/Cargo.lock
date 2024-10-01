@@ -275,7 +275,7 @@ dependencies = [
  "arbitrary",
  "bytes",
  "ensure-cov",
- "enum-as-inner 0.5.1",
+ "enum-as-inner 0.6.0",
  "enum_dispatch",
  "fxhash",
  "itertools 0.12.1",
@@ -533,7 +533,6 @@ dependencies = [
 name = "loro"
 version = "0.16.12"
 dependencies = [
- "either",
  "enum-as-inner 0.6.0",
  "generic-btree",
  "loro-common 0.16.12",
@@ -706,7 +705,7 @@ dependencies = [
  "bytes",
  "either",
  "ensure-cov",
- "enum-as-inner 0.5.1",
+ "enum-as-inner 0.6.0",
  "enum_dispatch",
  "fxhash",
  "generic-btree",

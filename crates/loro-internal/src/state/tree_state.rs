@@ -61,7 +61,7 @@ pub struct TreeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeStateNode {
     pub parent: TreeParentId,
-    pub position: Option<FractionalIndex>,
+    pub position: FractionalIndex,
     pub last_move_op: IdFull,
 }
 
@@ -134,13 +134,40 @@ impl TreeState {
     }
 
     /// Move the target node to DeletedRoot, and its descendants will also be moved together
-    fn _delete(&mut self, target: TreeID, id: IdFull) -> LoroResult<()> {
+    fn _delete_to_deleted_root(&mut self, target: TreeID, id: IdFull) {
+        self._delete(
+            target,
+            TreeParentId::Deleted,
+            FractionalIndex::default(),
+            id,
+        )
+        .unwrap();
+    }
+
+    fn _delete(
+        &mut self,
+        target: TreeID,
+        parent: TreeParentId,
+        position: FractionalIndex,
+        id: IdFull,
+    ) -> LoroResult<()> {
         if !self.trees.contains_key(&target) {
             return Err(LoroTreeError::TreeNodeDeletedOrNotExist(target).into());
         };
-        self.deleted.insert_delete_node_and_descendants(
+        if matches!(parent, TreeParentId::Deleted) {
+            self.deleted.insert_delete_node_to_root(
+                target,
+                id,
+                &mut self.trees,
+                &mut self.children,
+            );
+            return Ok(());
+        }
+        self.deleted.insert_delete_node_to_sub_tree(
             target,
+            parent,
             id,
+            position,
             &mut self.trees,
             &mut self.children,
         );
@@ -158,7 +185,7 @@ impl TreeState {
             target,
             TreeStateNode {
                 parent,
-                position: Some(position.clone()),
+                position: position.clone(),
                 last_move_op: id,
             },
         );
@@ -196,7 +223,7 @@ impl TreeState {
         target: TreeID,
         parent: TreeParentId,
         id: IdFull,
-        position: Option<FractionalIndex>,
+        position: FractionalIndex,
         with_check: bool,
     ) -> Result<(), LoroError> {
         if with_check {
@@ -215,7 +242,7 @@ impl TreeState {
         }
 
         let entry = self.children.entry(parent).or_default();
-        let node_position = NodePosition::new(position.clone().unwrap_or_default(), id.idlp());
+        let node_position = NodePosition::new(position.clone(), id.idlp());
         debug_assert!(!entry.has_child(&node_position));
         entry.insert_child(node_position, target);
 
@@ -236,12 +263,11 @@ impl TreeState {
         target: TreeID,
         parent: TreeParentId,
         last_move_op: IdFull,
-        position: Option<FractionalIndex>,
+        position: FractionalIndex,
     ) -> Result<(), LoroError> {
         debug_assert!(!self.trees.contains_key(&target));
         let entry = self.children.entry(parent).or_default();
-        let node_position =
-            NodePosition::new(position.clone().unwrap_or_default(), last_move_op.idlp());
+        let node_position = NodePosition::new(position.clone(), last_move_op.idlp());
         debug_assert!(!entry.has_child(&node_position));
         entry.push_child_in_order(node_position, target);
         self.trees.insert(
@@ -483,7 +509,7 @@ impl TreeState {
     }
 
     pub(crate) fn get_position(&self, target: &TreeID) -> Option<FractionalIndex> {
-        self.trees.get(target).and_then(|x| x.position.clone())
+        self.trees.get(target).map(|x| x.position.clone())
     }
 
     pub(crate) fn get_index_by_tree_id(&self, target: &TreeID) -> Option<usize> {
@@ -576,8 +602,7 @@ impl ContainerState for TreeState {
                 // create associated metadata container
                 match &diff.action {
                     TreeInternalDiff::Create { parent, position } => {
-                        self.mov(target, *parent, last_move_op, Some(position.clone()), false)
-                            .unwrap();
+                        self._create(target, *parent, last_move_op, position.clone());
                         let index = self.get_index_by_tree_id(&target).unwrap();
                         ans.push(TreeDiffItem {
                             target,
@@ -595,7 +620,7 @@ impl ContainerState for TreeState {
                         let was_alive = !self.is_node_deleted(&target).unwrap();
                         if need_check {
                             if self
-                                .mov(target, *parent, last_move_op, Some(position.clone()), true)
+                                ._mov(target, *parent, last_move_op, position.clone(), true)
                                 .is_ok()
                             {
                                 if self.is_node_deleted(&target).unwrap() {
@@ -635,7 +660,7 @@ impl ContainerState for TreeState {
                                 }
                             }
                         } else {
-                            self.mov(target, *parent, last_move_op, Some(position.clone()), false)
+                            self._mov(target, *parent, last_move_op, position.clone(), false)
                                 .unwrap();
 
                             let index = self.get_index_by_tree_id(&target).unwrap();
@@ -679,12 +704,21 @@ impl ContainerState for TreeState {
                                 },
                             });
                         }
-                        self.mov(target, *parent, last_move_op, position.clone(), false)
-                            .unwrap();
+                        self._delete(
+                            target,
+                            *parent,
+                            position.clone().unwrap_or_default(),
+                            last_move_op,
+                        )
+                        .unwrap();
                     }
                     TreeInternalDiff::MoveInDelete { parent, position } => {
-                        self.mov(target, *parent, last_move_op, position.clone(), false)
-                            .unwrap();
+                        self._mov_in_deleted(
+                            target,
+                            *parent,
+                            last_move_op,
+                            position.clone().unwrap_or_default(),
+                        );
                     }
                     TreeInternalDiff::UnCreate => {
                         // maybe the node created and moved to the parent deleted
@@ -728,25 +762,35 @@ impl ContainerState for TreeState {
                 let target = diff.target;
                 // create associated metadata container
                 match &diff.action {
-                    TreeInternalDiff::Create { parent, position }
-                    | TreeInternalDiff::Move {
+                    TreeInternalDiff::Create { parent, position } => {
+                        self._create(target, *parent, last_move_op, position.clone());
+                    }
+                    TreeInternalDiff::Move {
                         parent, position, ..
                     } => {
                         if need_check {
-                            self.mov(target, *parent, last_move_op, Some(position.clone()), true)
+                            self._mov(target, *parent, last_move_op, position.clone(), true)
                                 .unwrap_or_default();
                         } else {
-                            self.mov(target, *parent, last_move_op, Some(position.clone()), false)
+                            self._mov(target, *parent, last_move_op, position.clone(), false)
                                 .unwrap();
                         }
                     }
                     TreeInternalDiff::Delete { parent, position } => {
-                        self.mov(target, *parent, last_move_op, position.clone(), false)
-                            .unwrap();
+                        self._delete(
+                            target,
+                            *parent,
+                            position.clone().unwrap_or_default(),
+                            last_move_op,
+                        );
                     }
                     TreeInternalDiff::MoveInDelete { parent, position } => {
-                        self.mov(target, *parent, last_move_op, position.clone(), false)
-                            .unwrap();
+                        self._mov_in_deleted(
+                            target,
+                            *parent,
+                            last_move_op,
+                            position.clone().unwrap_or_default(),
+                        );
                     }
                     TreeInternalDiff::UnCreate => {
                         // delete it from state
@@ -774,24 +818,30 @@ impl ContainerState for TreeState {
                     target,
                     parent,
                     position,
+                } => {
+                    self._create(
+                        *target,
+                        TreeParentId::from(*parent),
+                        raw_op.id_full(),
+                        position.clone(),
+                    );
                 }
-                | TreeOp::Move {
+                TreeOp::Move {
                     target,
                     parent,
                     position,
                 } => {
                     let parent = TreeParentId::from(*parent);
-                    self.mov(
-                        *target,
-                        parent,
-                        raw_op.id_full(),
-                        Some(position.clone()),
-                        true,
-                    )?;
+                    self._mov(*target, parent, raw_op.id_full(), position.clone(), true)?;
                 }
                 TreeOp::Delete { target } => {
                     let parent = TreeParentId::Deleted;
-                    self.mov(*target, parent, raw_op.id_full(), None, true)?;
+                    self._delete(
+                        *target,
+                        parent,
+                        FractionalIndex::default(),
+                        raw_op.id_full(),
+                    )?;
                 }
             },
             _ => unreachable!(),
@@ -886,6 +936,12 @@ impl ContainerState for TreeState {
             }
             encoder.encode_op(node.last_move_op.idlp().into(), || unimplemented!());
         }
+        for node in self.deleted.all_deleted_nodes(&mut self.children) {
+            if node.last_move_op == IdFull::NONE_ID {
+                continue;
+            }
+            encoder.encode_op(node.last_move_op.idlp().into(), || unimplemented!());
+        }
         Vec::new()
     }
 
@@ -900,20 +956,26 @@ impl ContainerState for TreeState {
                     target,
                     parent,
                     position,
+                } => {
+                    self._create(
+                        *target,
+                        TreeParentId::from(*parent),
+                        op.id_full(),
+                        position.clone(),
+                    );
                 }
-                | TreeOp::Move {
+                TreeOp::Move {
                     target,
                     parent,
                     position,
                 } => {
                     let parent = TreeParentId::from(*parent);
-                    self.mov(*target, parent, op.id_full(), Some(position.clone()), false)
+                    self._mov(*target, parent, op.id_full(), position.clone(), false)
                         .unwrap()
                 }
                 TreeOp::Delete { target } => {
                     let parent = TreeParentId::Deleted;
-                    self.mov(*target, parent, op.id_full(), None, false)
-                        .unwrap()
+                    self._delete(*target, parent, FractionalIndex::default(), op.id_full());
                 }
             };
         }
@@ -1001,39 +1063,39 @@ mod snapshot {
     use super::{TreeNode, TreeParentId, TreeState};
     #[columnar(vec, ser, de, iterable)]
     #[derive(Debug, Clone)]
-    struct EncodedTreeNodeId {
+    pub(crate) struct EncodedTreeNodeId {
         #[columnar(strategy = "DeltaRle")]
-        peer_idx: usize,
+        pub(crate) peer_idx: usize,
         #[columnar(strategy = "DeltaRle")]
-        counter: i32,
+        pub(crate) counter: i32,
     }
 
     #[columnar(vec, ser, de, iterable)]
     #[derive(Debug, Clone)]
-    struct EncodedTreeNode {
+    pub(crate) struct EncodedTreeNode {
         /// If this field is 0, it means none, its parent is root
         /// If this field is 1, its parent is the deleted root
         #[columnar(strategy = "DeltaRle")]
-        parent_idx_plus_two: usize,
+        pub(crate) parent_idx_plus_two: usize,
         #[columnar(strategy = "DeltaRle")]
-        last_set_peer_idx: usize,
+        pub(crate) last_set_peer_idx: usize,
         #[columnar(strategy = "DeltaRle")]
-        last_set_counter: i32,
+        pub(crate) last_set_counter: i32,
         #[columnar(strategy = "DeltaRle")]
-        last_set_lamport_sub_counter: i32,
-        fractional_index_idx: usize,
+        pub(crate) last_set_lamport_sub_counter: i32,
+        pub(crate) fractional_index_idx: usize,
     }
 
     #[columnar(ser, de)]
-    struct EncodedTree<'a> {
+    pub(crate) struct EncodedTree<'a> {
         #[columnar(class = "vec", iter = "EncodedTreeNodeId")]
-        node_ids: Vec<EncodedTreeNodeId>,
+        pub(crate) node_ids: Vec<EncodedTreeNodeId>,
         #[columnar(class = "vec", iter = "EncodedTreeNode")]
-        nodes: Vec<EncodedTreeNode>,
+        pub(crate) nodes: Vec<EncodedTreeNode>,
         #[columnar(borrow)]
-        fractional_indexes: Cow<'a, [u8]>,
+        pub(crate) fractional_indexes: Cow<'a, [u8]>,
         #[columnar(borrow)]
-        reserved_has_effect_bool_rle: Cow<'a, [u8]>,
+        pub(crate) reserved_has_effect_bool_rle: Cow<'a, [u8]>,
     }
 
     fn encode(
@@ -1184,9 +1246,9 @@ mod snapshot {
                         node.last_set_counter,
                         (node.last_set_lamport_sub_counter + node.last_set_counter) as Lamport,
                     ),
-                    Some(FractionalIndex::from_bytes(
+                    FractionalIndex::from_bytes(
                         fractional_indexes[node.fractional_index_idx].clone(),
-                    )),
+                    ),
                 )
                 .unwrap();
             }
