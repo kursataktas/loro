@@ -19,7 +19,6 @@ pub trait ToDeleteNode {
         target: TreeID,
         id: IdFull,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     );
 
     fn insert_delete_node_to_sub_tree(
@@ -29,10 +28,9 @@ pub trait ToDeleteNode {
         id: IdFull,
         position: FractionalIndex,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     );
 
-    fn remove_from_deleted(&mut self, target: TreeID, children: &mut TreeChildrenCache);
+    fn remove_from_deleted(&mut self, target: TreeID);
 
     fn mov_in_deleted(
         &mut self,
@@ -40,13 +38,9 @@ pub trait ToDeleteNode {
         parent: TreeParentId,
         id: IdFull,
         position: FractionalIndex,
-        children: &mut TreeChildrenCache,
     );
 
-    fn all_deleted_nodes(
-        &mut self,
-        children: &mut TreeChildrenCache,
-    ) -> impl Iterator<Item = &TreeStateNode>;
+    fn all_deleted_nodes(&mut self) -> Vec<TreeStateNode>;
 }
 
 impl ToDeleteNode for DeletedNodes {
@@ -55,11 +49,10 @@ impl ToDeleteNode for DeletedNodes {
         target: TreeID,
         id: IdFull,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     ) {
         match self {
-            DeletedNodes::Cache(x) => x.insert_delete_node_to_root(target, id, tree, children),
-            DeletedNodes::Nodes(x) => x.insert_delete_node_to_root(target, id, tree, children),
+            DeletedNodes::Cache(x) => x.new_delete.insert_delete_node_to_root(target, id, tree),
+            DeletedNodes::Nodes(x) => x.insert_delete_node_to_root(target, id, tree),
         }
     }
 
@@ -70,35 +63,33 @@ impl ToDeleteNode for DeletedNodes {
         id: IdFull,
         position: FractionalIndex,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     ) {
         match self {
             DeletedNodes::Cache(x) => {
                 let this = std::mem::take(x);
-                let mut deleted = this.parse(children);
-                deleted
-                    .insert_delete_node_to_sub_tree(target, parent, id, position, tree, children);
+                let mut deleted = this.parse();
+                deleted.insert_delete_node_to_sub_tree(target, parent, id, position, tree);
                 *self = DeletedNodes::Nodes(deleted);
             }
             DeletedNodes::Nodes(x) => {
-                x.insert_delete_node_to_sub_tree(target, parent, id, position, tree, children)
+                x.insert_delete_node_to_sub_tree(target, parent, id, position, tree)
             }
         }
     }
 
-    fn remove_from_deleted(&mut self, target: TreeID, children: &mut TreeChildrenCache) {
+    fn remove_from_deleted(&mut self, target: TreeID) {
         match self {
             DeletedNodes::Cache(x) => {
                 if x.new_delete.tree.contains_key(&target) {
-                    x.remove_from_deleted(target, children);
+                    x.new_delete.remove_from_deleted(target)
                 } else {
                     let this = std::mem::take(x);
-                    let mut deleted = this.parse(children);
-                    deleted.remove_from_deleted(target, children);
+                    let mut deleted = this.parse();
+                    deleted.remove_from_deleted(target);
                     *self = DeletedNodes::Nodes(deleted);
                 }
             }
-            DeletedNodes::Nodes(x) => x.remove_from_deleted(target, children),
+            DeletedNodes::Nodes(x) => x.remove_from_deleted(target),
         }
     }
 
@@ -108,31 +99,27 @@ impl ToDeleteNode for DeletedNodes {
         parent: TreeParentId,
         id: IdFull,
         position: FractionalIndex,
-        children: &mut TreeChildrenCache,
     ) {
         match self {
             DeletedNodes::Cache(x) => {
                 let this = std::mem::take(x);
-                let mut deleted = this.parse(children);
-                deleted.mov_in_deleted(target, parent, id, position, children);
+                let mut deleted = this.parse();
+                deleted.mov_in_deleted(target, parent, id, position);
                 *self = DeletedNodes::Nodes(deleted);
             }
-            DeletedNodes::Nodes(x) => x.mov_in_deleted(target, parent, id, position, children),
+            DeletedNodes::Nodes(x) => x.mov_in_deleted(target, parent, id, position),
         }
     }
 
-    fn all_deleted_nodes(
-        &mut self,
-        children: &mut TreeChildrenCache,
-    ) -> impl Iterator<Item = &TreeStateNode> {
+    fn all_deleted_nodes(&mut self) -> Vec<TreeStateNode> {
         match self {
             DeletedNodes::Cache(x) => {
                 let this = std::mem::take(x);
-                let deleted = this.parse(children);
+                let deleted = this.parse();
                 *self = DeletedNodes::Nodes(deleted);
-                self.all_deleted_nodes(children)
+                self.all_deleted_nodes()
             }
-            DeletedNodes::Nodes(x) => x.all_deleted_nodes(children),
+            DeletedNodes::Nodes(x) => x.all_deleted_nodes(),
         }
     }
 }
@@ -146,7 +133,7 @@ pub struct UnParsedDeletedNodes {
 }
 
 impl UnParsedDeletedNodes {
-    fn parse(self, children: &mut TreeChildrenCache) -> DeletedNodesInner {
+    fn parse(self) -> DeletedNodesInner {
         let mut ans = DeletedNodesInner::default();
         let encoded_tree: EncodedTree = serde_columnar::from_bytes(&self.bytes).unwrap();
         let node_ids = encoded_tree
@@ -179,11 +166,13 @@ impl UnParsedDeletedNodes {
                     last_move_op,
                 },
             );
-            debug_assert!(!children.contains_key(&parent));
-            let entry = children.entry(parent).or_default();
-            let node_position = NodePosition::new(position, last_move_op.idlp());
-            debug_assert!(!entry.has_child(&node_position));
-            entry.push_child_in_order(node_position, *node_id);
+            ans.children.with_cache_mut(move |children| {
+                debug_assert!(!children.contains_key(&parent));
+                let entry = children.entry(parent).or_default();
+                let node_position = NodePosition::new(position, last_move_op.idlp());
+                debug_assert!(!entry.has_child(&node_position));
+                entry.push_child_in_order(node_position, *node_id);
+            });
         }
 
         for (target, node) in self.new_delete.tree {
@@ -198,6 +187,7 @@ impl UnParsedDeletedNodes {
 #[derive(Debug, Clone, Default)]
 pub struct DeletedNodesInner {
     tree: FxHashMap<TreeID, TreeStateNode>,
+    children: TreeChildrenCache,
 }
 
 impl ToDeleteNode for DeletedNodesInner {
@@ -206,7 +196,6 @@ impl ToDeleteNode for DeletedNodesInner {
         target: TreeID,
         id: IdFull,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     ) {
         self.insert_deleted_to_parent(
             target,
@@ -214,7 +203,6 @@ impl ToDeleteNode for DeletedNodesInner {
             TreeParentId::Deleted,
             FractionalIndex::default(),
             tree,
-            children,
         );
     }
 
@@ -225,14 +213,16 @@ impl ToDeleteNode for DeletedNodesInner {
         id: IdFull,
         position: FractionalIndex,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     ) {
-        self.insert_deleted_to_parent(target, id, parent, position, tree, children);
+        self.insert_deleted_to_parent(target, id, parent, position, tree);
     }
 
-    fn remove_from_deleted(&mut self, target: TreeID, children: &mut TreeChildrenCache) {
+    fn remove_from_deleted(&mut self, target: TreeID) {
         let node = self.tree.remove(&target).unwrap();
-        children
+        self.children
+            .0
+            .try_lock()
+            .unwrap()
             .get_mut(&node.parent)
             .unwrap()
             .delete_child(&target);
@@ -244,7 +234,6 @@ impl ToDeleteNode for DeletedNodesInner {
         parent: TreeParentId,
         id: IdFull,
         position: FractionalIndex,
-        children: &mut TreeChildrenCache,
     ) {
         let node = self.tree.get_mut(&target).unwrap();
         let old_parent = node.parent;
@@ -253,21 +242,20 @@ impl ToDeleteNode for DeletedNodesInner {
             position: position.clone(),
             last_move_op: id,
         };
-        children.get_mut(&old_parent).unwrap().delete_child(&target);
-        children.entry(parent).or_default().insert_child(
-            NodePosition {
-                position,
-                idlp: id.idlp(),
-            },
-            target,
-        );
+        self.children.with_cache_mut(|children| {
+            children.get_mut(&old_parent).unwrap().delete_child(&target);
+            children.entry(parent).or_default().insert_child(
+                NodePosition {
+                    position,
+                    idlp: id.idlp(),
+                },
+                target,
+            );
+        });
     }
 
-    fn all_deleted_nodes(
-        &mut self,
-        _children: &mut TreeChildrenCache,
-    ) -> impl Iterator<Item = &TreeStateNode> {
-        self.tree.values()
+    fn all_deleted_nodes(&mut self) -> Vec<TreeStateNode> {
+        self.tree.values().into_iter().cloned().collect()
     }
 }
 
@@ -279,12 +267,11 @@ impl DeletedNodesInner {
         parent: TreeParentId,
         position: FractionalIndex,
         tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
     ) {
         println!("\n\n{tree:?}");
         if let Some(old_parent) = tree.get(&target).map(|x| x.parent) {
             // remove old position
-            if let Some(x) = children.get_mut(&old_parent) {
+            if let Some(x) = self.children.0.try_lock().unwrap().get_mut(&old_parent) {
                 x.delete_child(&target);
             }
         }
@@ -298,78 +285,34 @@ impl DeletedNodesInner {
             },
         );
 
-        println!("children {:?} \n {parent:?} {target} {id:?}", children);
-
-        children
-            .entry(parent)
-            .or_default()
-            .insert_child(NodePosition::new(position, id.idlp()), target);
-        let mut q = VecDeque::from_iter(
-            children
-                .entry(TreeParentId::Node(target))
-                .or_default()
-                .iter()
-                .map(|n| *n.1),
+        println!(
+            "children {:?} \n {parent:?} {target} {id:?}",
+            self.children.0.try_lock().unwrap()
         );
-        while let Some(child) = q.pop_front() {
-            let node = tree.remove(&child).unwrap();
-            self.tree.insert(child, node);
-            q.extend(
+
+        self.children.with_cache_mut(|children| {
+            children
+                .entry(parent)
+                .or_default()
+                .insert_child(NodePosition::new(position, id.idlp()), target);
+            let mut q = VecDeque::from_iter(
                 children
-                    .entry(TreeParentId::Node(child))
+                    .entry(TreeParentId::Node(target))
                     .or_default()
                     .iter()
                     .map(|n| *n.1),
             );
-        }
-    }
-}
-
-impl ToDeleteNode for UnParsedDeletedNodes {
-    fn insert_delete_node_to_root(
-        &mut self,
-        target: TreeID,
-        id: IdFull,
-        tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children_mapping: &mut TreeChildrenCache,
-    ) {
-        self.new_delete
-            .insert_delete_node_to_root(target, id, tree, children_mapping);
-    }
-
-    fn remove_from_deleted(&mut self, target: TreeID, children: &mut TreeChildrenCache) {
-        if self.new_delete.tree.contains_key(&target) {
-            return self.new_delete.remove_from_deleted(target, children);
-        }
-    }
-
-    fn mov_in_deleted(
-        &mut self,
-        target: TreeID,
-        parent: TreeParentId,
-        id: IdFull,
-        position: FractionalIndex,
-        children: &mut TreeChildrenCache,
-    ) {
-        unreachable!()
-    }
-
-    fn insert_delete_node_to_sub_tree(
-        &mut self,
-        target: TreeID,
-        parent: TreeParentId,
-        id: IdFull,
-        position: FractionalIndex,
-        tree: &mut FxHashMap<TreeID, TreeStateNode>,
-        children: &mut TreeChildrenCache,
-    ) {
-        unreachable!()
-    }
-
-    fn all_deleted_nodes(
-        &mut self,
-        children: &mut TreeChildrenCache,
-    ) -> impl Iterator<Item = &TreeStateNode> {
-        unreachable!()
+            while let Some(child) = q.pop_front() {
+                let node = tree.remove(&child).unwrap();
+                self.tree.insert(child, node);
+                q.extend(
+                    children
+                        .entry(TreeParentId::Node(child))
+                        .or_default()
+                        .iter()
+                        .map(|n| *n.1),
+                );
+            }
+        });
     }
 }

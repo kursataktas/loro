@@ -1,4 +1,7 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
+};
 
 use either::Either;
 use fractional_index::FractionalIndex;
@@ -217,7 +220,19 @@ impl NodeChildren {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct TreeChildrenCache(FxHashMap<TreeParentId, NodeChildren>);
+pub(crate) struct TreeChildrenCache(pub(crate) Arc<Mutex<FxHashMap<TreeParentId, NodeChildren>>>);
+
+impl TreeChildrenCache {
+    pub fn with_cache(&self, f: impl FnOnce(&FxHashMap<TreeParentId, NodeChildren>)) {
+        let t = self.0.try_lock().unwrap();
+        f(&t)
+    }
+
+    pub fn with_cache_mut(&self, f: impl FnOnce(&mut FxHashMap<TreeParentId, NodeChildren>)) {
+        let mut t = self.0.try_lock().unwrap();
+        f(&mut t)
+    }
+}
 
 mod btree {
     use std::{cmp::Ordering, ops::Range, sync::Arc};
@@ -511,7 +526,7 @@ mod btree {
 impl std::fmt::Debug for TreeChildrenCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "TreeChildrenCache {{")?;
-        for (parent, children) in self.0.iter() {
+        for (parent, children) in self.0.try_lock().unwrap().iter() {
             writeln!(f, "  {:?}:{{", parent)?;
             for (position, id) in children.iter() {
                 writeln!(f, "      {:?} -> {:?}", position, id)?;
@@ -519,20 +534,6 @@ impl std::fmt::Debug for TreeChildrenCache {
             writeln!(f, "  }}")?;
         }
         writeln!(f, "}}")
-    }
-}
-
-impl Deref for TreeChildrenCache {
-    type Target = FxHashMap<TreeParentId, NodeChildren>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for TreeChildrenCache {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }
 

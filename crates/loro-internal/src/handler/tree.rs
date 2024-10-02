@@ -750,7 +750,7 @@ impl TreeHandler {
             }
             MaybeDetached::Attached(a) => a.with_state(|state| {
                 let a = state.as_tree_state().unwrap();
-                a.get_children(parent).map(|x| x.collect())
+                a.get_children(parent)
             }),
         }
     }
@@ -845,7 +845,7 @@ impl TreeHandler {
             }
             MaybeDetached::Attached(a) => a.with_state(|state| {
                 let a = state.as_tree_state().unwrap();
-                a.get_all_hierarchy_nodes_under(parent)
+                a.get_all_hierarchy_nodes_under(parent, &a.children.0.try_lock().unwrap())
             }),
         }
     }

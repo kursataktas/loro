@@ -1,3 +1,4 @@
+use children::NodeChildren;
 use deleted_cache::{DeletedNodes, ToDeleteNode};
 use enum_as_inner::EnumAsInner;
 use fractional_index::FractionalIndex;
@@ -52,8 +53,8 @@ pub enum TreeFractionalIndexConfigInner {
 pub struct TreeState {
     idx: ContainerIdx,
     trees: FxHashMap<TreeID, TreeStateNode>,
-    deleted: DeletedNodes,
-    children: TreeChildrenCache,
+    deleted: Arc<Mutex<DeletedNodes>>,
+    pub(crate) children: TreeChildrenCache,
     fractional_index_config: TreeFractionalIndexConfigInner,
     peer_id: PeerID,
 }
@@ -126,7 +127,7 @@ impl TreeState {
         Self {
             idx,
             trees: FxHashMap::default(),
-            deleted: DeletedNodes::Nodes(Default::default()),
+            deleted: Arc::new(Mutex::new(DeletedNodes::Nodes(Default::default()))),
             children: Default::default(),
             fractional_index_config: TreeFractionalIndexConfigInner::default(),
             peer_id,
@@ -155,22 +156,17 @@ impl TreeState {
             return Err(LoroTreeError::TreeNodeDeletedOrNotExist(target).into());
         };
         if matches!(parent, TreeParentId::Deleted) {
-            self.deleted.insert_delete_node_to_root(
+            self.deleted.try_lock().unwrap().insert_delete_node_to_root(
                 target,
                 id,
                 &mut self.trees,
-                &mut self.children,
             );
             return Ok(());
         }
-        self.deleted.insert_delete_node_to_sub_tree(
-            target,
-            parent,
-            id,
-            position,
-            &mut self.trees,
-            &mut self.children,
-        );
+        self.deleted
+            .try_lock()
+            .unwrap()
+            .insert_delete_node_to_sub_tree(target, parent, id, position, &mut self.trees);
         Ok(())
     }
 
@@ -190,6 +186,9 @@ impl TreeState {
             },
         );
         self.children
+            .0
+            .try_lock()
+            .unwrap()
             .entry(parent)
             .or_default()
             .insert_child(NodePosition::new(position, id.idlp()), target);
@@ -203,7 +202,7 @@ impl TreeState {
         position: FractionalIndex,
     ) {
         // move out from deleted
-        self.deleted.remove_from_deleted(target, &mut self.children);
+        self.deleted.try_lock().unwrap().remove_from_deleted(target);
         self._create(target, parent, id, position);
     }
 
@@ -215,7 +214,9 @@ impl TreeState {
         position: FractionalIndex,
     ) {
         self.deleted
-            .mov_in_deleted(target, parent, id, position, &mut self.children);
+            .try_lock()
+            .unwrap()
+            .mov_in_deleted(target, parent, id, position);
     }
 
     fn _mov(
@@ -241,10 +242,12 @@ impl TreeState {
             self.delete_position(&old_parent, &target);
         }
 
-        let entry = self.children.entry(parent).or_default();
-        let node_position = NodePosition::new(position.clone(), id.idlp());
-        debug_assert!(!entry.has_child(&node_position));
-        entry.insert_child(node_position, target);
+        self.children.with_cache_mut(|children| {
+            let entry = children.entry(parent).or_default();
+            let node_position = NodePosition::new(position.clone(), id.idlp());
+            debug_assert!(!entry.has_child(&node_position));
+            entry.insert_child(node_position, target);
+        });
 
         self.trees.insert(
             target,
@@ -266,10 +269,13 @@ impl TreeState {
         position: FractionalIndex,
     ) -> Result<(), LoroError> {
         debug_assert!(!self.trees.contains_key(&target));
-        let entry = self.children.entry(parent).or_default();
-        let node_position = NodePosition::new(position.clone(), last_move_op.idlp());
-        debug_assert!(!entry.has_child(&node_position));
-        entry.push_child_in_order(node_position, target);
+        self.children.with_cache_mut(|children| {
+            let entry = children.entry(parent).or_default();
+            let node_position = NodePosition::new(position.clone(), last_move_op.idlp());
+            debug_assert!(!entry.has_child(&node_position));
+            entry.push_child_in_order(node_position, target);
+        });
+
         self.trees.insert(
             target,
             TreeStateNode {
@@ -338,48 +344,52 @@ impl TreeState {
     // Get all flat tree nodes under the parent
     pub(crate) fn get_all_tree_nodes_under(&self, root: TreeParentId) -> Vec<TreeNode> {
         let mut ans = vec![];
-        let children = self.children.get(&root);
-        let mut q = children
-            .map(|x| VecDeque::from_iter(x.iter().enumerate().zip(std::iter::repeat(root))))
-            .unwrap_or_default();
+        self.children.with_cache(|cache| {
+            let children = cache.get(&root);
+            let mut q = children
+                .map(|x| VecDeque::from_iter(x.iter().enumerate().zip(std::iter::repeat(root))))
+                .unwrap_or_default();
 
-        while let Some(((index, (position, &target)), parent)) = q.pop_front() {
-            ans.push(TreeNode {
-                id: target,
-                parent,
-                fractional_index: position.position.clone(),
-                index,
-                last_move_op: self.trees.get(&target).map(|x| x.last_move_op).unwrap(),
-            });
-            if let Some(children) = self.children.get(&TreeParentId::Node(target)) {
-                q.extend(
-                    children
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (position, this_target))| {
+            while let Some(((index, (position, &target)), parent)) = q.pop_front() {
+                ans.push(TreeNode {
+                    id: target,
+                    parent,
+                    fractional_index: position.position.clone(),
+                    index,
+                    last_move_op: self.trees.get(&target).map(|x| x.last_move_op).unwrap(),
+                });
+                if let Some(children) = cache.get(&TreeParentId::Node(target)) {
+                    q.extend(children.iter().enumerate().map(
+                        |(index, (position, this_target))| {
                             ((index, (position, this_target)), TreeParentId::Node(target))
-                        }),
-                );
+                        },
+                    ));
+                }
             }
-        }
+        });
+
         ans
     }
 
     pub(crate) fn get_all_hierarchy_nodes_under(
         &self,
         root: TreeParentId,
+        children_cache: &FxHashMap<TreeParentId, NodeChildren>,
     ) -> Vec<TreeNodeWithChildren> {
         let mut ans = vec![];
-        let Some(children) = self.children.get(&root) else {
+        let cache = children_cache;
+        let Some(children) = cache.get(&root) else {
             return ans;
         };
-        for (index, (position, &target)) in children.iter().enumerate() {
+        for (index, (position, target)) in children.iter().map(|(k, v)| (k.clone(), *v)).enumerate()
+        {
             ans.push(TreeNodeWithChildren {
                 id: target,
                 parent: root,
                 fractional_index: position.position.clone(),
                 index,
-                children: self.get_all_hierarchy_nodes_under(TreeParentId::Node(target)),
+                children: self
+                    .get_all_hierarchy_nodes_under(TreeParentId::Node(target), children_cache),
             })
         }
         ans
@@ -398,8 +408,7 @@ impl TreeState {
     }
 
     fn _bfs_all_nodes(&self, root: TreeParentId, ans: &mut Vec<TreeNode>) {
-        let children = self.children.get(&root);
-        if let Some(children) = children {
+        if let Some(children) = self.children.0.try_lock().unwrap().get(&root) {
             for (index, (position, target)) in children.iter().enumerate() {
                 ans.push(TreeNode {
                     id: *target,
@@ -430,15 +439,22 @@ impl TreeState {
             .unwrap_or(0)
     }
 
-    pub fn get_children<'a>(
-        &'a self,
-        parent: &TreeParentId,
-    ) -> Option<impl Iterator<Item = TreeID> + 'a> {
-        self.children.get(parent).map(|x| x.iter().map(|x| *x.1))
+    pub fn get_children<'a>(&'a self, parent: &TreeParentId) -> Option<Vec<TreeID>> {
+        self.children
+            .0
+            .try_lock()
+            .unwrap()
+            .get(parent)
+            .map(|x| x.iter().map(|x| *x.1).collect())
     }
 
     pub fn children_num(&self, parent: &TreeParentId) -> Option<usize> {
-        self.children.get(parent).map(|x| x.len())
+        self.children
+            .0
+            .try_lock()
+            .unwrap()
+            .get(parent)
+            .map(|x| x.len())
     }
 
     /// Determine whether the target is the child of the node
@@ -452,7 +468,7 @@ impl TreeState {
 
     /// Delete the position cache of the node
     pub(crate) fn delete_position(&mut self, parent: &TreeParentId, target: &TreeID) {
-        if let Some(x) = self.children.get_mut(parent) {
+        if let Some(x) = self.children.0.try_lock().unwrap().get_mut(parent) {
             x.delete_child(target);
         }
     }
@@ -467,11 +483,17 @@ impl TreeState {
             TreeFractionalIndexConfigInner::GenerateFractionalIndex { jitter, rng } => {
                 if *jitter == 0 {
                     self.children
+                        .0
+                        .try_lock()
+                        .unwrap()
                         .entry(*parent)
                         .or_default()
                         .generate_fi_at(index, target)
                 } else {
                     self.children
+                        .0
+                        .try_lock()
+                        .unwrap()
                         .entry(*parent)
                         .or_default()
                         .generate_fi_at_jitter(index, target, rng.as_mut(), *jitter)
@@ -517,6 +539,9 @@ impl TreeState {
         (!parent.is_deleted())
             .then(|| {
                 self.children
+                    .0
+                    .try_lock()
+                    .unwrap()
                     .get(&parent)
                     .and_then(|x| x.get_index_by_child_id(target))
             })
@@ -528,7 +553,7 @@ impl TreeState {
         parent: &TreeParentId,
         node_position: &NodePosition,
     ) -> Option<usize> {
-        self.children.get(parent).map(|c| {
+        self.children.0.try_lock().unwrap().get(parent).map(|c| {
             match c.get_last_insert_index_by_position(node_position) {
                 Ok(i) => i,
                 Err(i) => i,
@@ -538,7 +563,14 @@ impl TreeState {
 
     pub(crate) fn get_id_by_index(&self, parent: &TreeParentId, index: usize) -> Option<TreeID> {
         (!parent.is_deleted())
-            .then(|| self.children.get(parent).and_then(|x| x.get_id_at(index)))
+            .then(|| {
+                self.children
+                    .0
+                    .try_lock()
+                    .unwrap()
+                    .get(parent)
+                    .and_then(|x| x.get_id_at(index))
+            })
             .flatten()
     }
 
@@ -556,7 +588,7 @@ impl TreeState {
 
         for (parent, children) in parent_children_map.iter() {
             let cached_children = self.get_children(parent).expect("parent not found");
-            let cached_children = cached_children.collect::<FxHashSet<_>>();
+            let cached_children = cached_children.into_iter().collect::<FxHashSet<_>>();
             if &cached_children != children {
                 panic!(
                     "tree integrity broken: children set of node {:?} is not consistent",
@@ -736,6 +768,9 @@ impl ContainerState for TreeState {
                         if let Some(node) = node {
                             if !node.parent.is_deleted() {
                                 self.children
+                                    .0
+                                    .try_lock()
+                                    .unwrap()
                                     .get_mut(&node.parent)
                                     .unwrap()
                                     .delete_child(&target);
@@ -798,6 +833,9 @@ impl ContainerState for TreeState {
                         if let Some(parent) = parent {
                             if !parent.parent.is_deleted() {
                                 self.children
+                                    .0
+                                    .try_lock()
+                                    .unwrap()
                                     .get_mut(&parent.parent)
                                     .unwrap()
                                     .delete_child(&target);
@@ -857,13 +895,15 @@ impl ContainerState for TreeState {
         _state: &Weak<Mutex<DocState>>,
     ) -> Diff {
         let mut diffs = vec![];
-        let Some(roots) = self.children.get(&TreeParentId::Root) else {
+        let c = self.children.0.try_lock().unwrap();
+        let Some(roots) = c.get(&TreeParentId::Root) else {
             return Diff::Tree(TreeDiff { diff: vec![] });
         };
 
         let mut q = VecDeque::from_iter(roots.iter());
         let mut index = 0;
         let mut parent = TreeParentId::Root;
+        let c = self.children.0.try_lock().unwrap();
         while let Some((position, node)) = q.pop_front() {
             let node_parent = self.trees.get(node).unwrap().parent;
             if node_parent != parent {
@@ -880,7 +920,7 @@ impl ContainerState for TreeState {
             };
             index += 1;
             diffs.push(diff);
-            if let Some(children) = self.children.get(&TreeParentId::Node(*node)) {
+            if let Some(children) = c.get(&TreeParentId::Node(*node)) {
                 // TODO: Refactor: you can include the index and parent in the q
                 // The code will be more robust and easy to understand
                 q.extend(children.iter());
@@ -891,7 +931,7 @@ impl ContainerState for TreeState {
     }
 
     fn get_value(&mut self) -> LoroValue {
-        self.get_all_hierarchy_nodes_under(TreeParentId::Root)
+        self.get_all_hierarchy_nodes_under(TreeParentId::Root, &self.children.0.try_lock().unwrap())
             .into_iter()
             .map(|x| x.into_value())
             .collect::<Vec<_>>()
@@ -936,7 +976,7 @@ impl ContainerState for TreeState {
             }
             encoder.encode_op(node.last_move_op.idlp().into(), || unimplemented!());
         }
-        for node in self.deleted.all_deleted_nodes(&mut self.children) {
+        for node in self.deleted.try_lock().unwrap().all_deleted_nodes() {
             if node.last_move_op == IdFull::NONE_ID {
                 continue;
             }
